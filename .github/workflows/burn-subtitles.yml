@@ -1,4 +1,4 @@
-name: Burn subtitles and upload
+name: Burn subtitles and publish result
 
 on:
   workflow_dispatch:
@@ -9,52 +9,113 @@ on:
         required: true
       vttUrl:
         required: true
+      n8nRunId:
+        required: true
       start:
         required: false
         default: "0"
       end:
         required: false
-      n8nWebhook:
-        required: true
 
 jobs:
   burn:
     runs-on: ubuntu-latest
     steps:
-      - name: Install ffmpeg and fonts
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-inter jq
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install ffmpeg, git, jq and fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg git jq fonts-inter
 
       - name: Download video
-        run: curl -L "${{ github.event.inputs.videoUrl }}" -o input.mp4
+        run: |
+          echo "Downloading video from ${{ github.event.inputs.videoUrl }}"
+          curl -L "${{ github.event.inputs.videoUrl }}" -o input.mp4
 
       - name: Download audio
-        run: curl -L "${{ github.event.inputs.audioUrl }}" -o input_audio.mp3
+        run: |
+          echo "Downloading audio from ${{ github.event.inputs.audioUrl }}"
+          curl -L "${{ github.event.inputs.audioUrl }}" -o input_audio.mp3
 
       - name: Download vtt
-        run: curl -L "${{ github.event.inputs.vttUrl }}" -o subs.vtt
+        run: |
+          echo "Downloading vtt from ${{ github.event.inputs.vttUrl }}"
+          curl -L "${{ github.event.inputs.vttUrl }}" -o subs.vtt
 
       - name: Run ffmpeg to burn subtitles
         run: |
-          START=${{ github.event.inputs.start }}
-          END=${{ github.event.inputs.end }}
-          TRIM=""
-          if [ -n "$END" ]; then TRIM="-ss $START -to $END"; else TRIM="-ss $START"; fi
+          set -euo pipefail
+          START="${{ github.event.inputs.start }}"
+          END="${{ github.event.inputs.end }}"
+          TRIM_ARGS=""
+          if [ -n "$END" ]; then
+            TRIM_ARGS="-ss $START -to $END"
+          else
+            TRIM_ARGS="-ss $START"
+          fi
+          # Subtitle style: Inter font, size 48, white text, semi-transparent black background, centered vertically
           STYLE="Fontname=Inter,Fontsize=48,PrimaryColour=&H00FFFFFF,BackColour=&H80000000,BorderStyle=4,Alignment=5"
-          ffmpeg -y $TRIM -i input.mp4 -i input_audio.mp3 -vf "subtitles=subs.vtt:force_style='$STYLE'" -c:v libx264 -preset fast -crf 18 -c:a aac -shortest output_burned.mp4
+          echo "Running ffmpeg with trim args: $TRIM_ARGS"
+          ffmpeg -y $TRIM_ARGS -i input.mp4 -i input_audio.mp3 -vf "subtitles=subs.vtt:force_style='$STYLE'" -c:v libx264 -preset fast -crf 18 -c:a aac -shortest output_burned.mp4
 
       - name: Upload to Cloudinary using unsigned preset
         env:
           CLOUD_NAME: dzrclu7ck
           UPLOAD_PRESET: ${{ secrets.CLOUDINARY_UPLOAD_PRESET }}
         run: |
+          set -euo pipefail
+          echo "Uploading output_burned.mp4 to Cloudinary (unsigned preset)"
           RESPONSE=$(curl -s -X POST "https://api.cloudinary.com/v1_1/$CLOUD_NAME/video/upload" \
             -F "file=@output_burned.mp4" \
             -F "upload_preset=$UPLOAD_PRESET")
           echo "$RESPONSE" > upload_response.json
-          echo "UPLOAD_URL=$(jq -r .secure_url upload_response.json)" >> $GITHUB_ENV
+          # Extract secure_url for later use
+          SECURE_URL=$(jq -r .secure_url upload_response.json)
+          if [ -z "$SECURE_URL" ] || [ "$SECURE_URL" = "null" ]; then
+            echo "Upload failed, response:"
+            cat upload_response.json
+            exit 1
+          fi
+          echo "Uploaded to: $SECURE_URL"
+          echo "SECURE_URL=$SECURE_URL" >> $GITHUB_ENV
 
-      - name: Notify n8n webhook
+      - name: Prepare result file for n8n
         run: |
-          curl -s -X POST "${{ github.event.inputs.n8nWebhook }}" \
-            -H "Content-Type: application/json" \
-            -d "{\"finalUrl\":\"${{ env.UPLOAD_URL }}\"}"
+          set -euo pipefail
+          RUN_ID="${{ github.event.inputs.n8nRunId }}"
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          mkdir -p results
+          jq -n --arg url "${{ env.SECURE_URL }}" --arg runId "$RUN_ID" --arg ts "$TIMESTAMP" '{ finalUrl: $url, runId: $runId, timestamp: $ts }' > "results/result-$RUN_ID.json"
+          echo "Wrote results/result-$RUN_ID.json"
+          echo "RESULT_FILE=results/result-$RUN_ID.json" >> $GITHUB_ENV
+
+      - name: Commit result file back to repo (push to main)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          RESULT_FILE="${{ env.RESULT_FILE }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Create a branch for the result to avoid conflicts, then push to main
+          BRANCH="add-result-${GITHUB_RUN_ID}"
+          git checkout -b "$BRANCH" || git checkout "$BRANCH"
+          git add "$RESULT_FILE"
+          git commit -m "Add processing result $GITHUB_RUN_ID" || echo "No changes to commit"
+          # Push branch and then merge into main (attempt fast-forward merge)
+          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git" HEAD:"$BRANCH"
+          # Try to merge branch into main using the token
+          git fetch origin main
+          git checkout main
+          git pull "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git" main || true
+          git merge --no-edit "$BRANCH" || echo "Merge may have conflicts or already merged"
+          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git" main || echo "Push to main failed; branch $BRANCH contains the result"
+
+      - name: Output result info
+        run: |
+          echo "Result file: ${{ env.RESULT_FILE }}"
+          echo "Final URL: ${{ env.SECURE_URL }}"
