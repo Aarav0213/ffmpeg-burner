@@ -1,0 +1,60 @@
+name: Burn subtitles and upload
+
+on:
+  workflow_dispatch:
+    inputs:
+      videoUrl:
+        required: true
+      audioUrl:
+        required: true
+      vttUrl:
+        required: true
+      start:
+        required: false
+        default: "0"
+      end:
+        required: false
+      n8nWebhook:
+        required: true
+
+jobs:
+  burn:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install ffmpeg and fonts
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-inter jq
+
+      - name: Download video
+        run: curl -L "${{ github.event.inputs.videoUrl }}" -o input.mp4
+
+      - name: Download audio
+        run: curl -L "${{ github.event.inputs.audioUrl }}" -o input_audio.mp3
+
+      - name: Download vtt
+        run: curl -L "${{ github.event.inputs.vttUrl }}" -o subs.vtt
+
+      - name: Run ffmpeg to burn subtitles
+        run: |
+          START=${{ github.event.inputs.start }}
+          END=${{ github.event.inputs.end }}
+          TRIM=""
+          if [ -n "$END" ]; then TRIM="-ss $START -to $END"; else TRIM="-ss $START"; fi
+          STYLE="Fontname=Inter,Fontsize=48,PrimaryColour=&H00FFFFFF,BackColour=&H80000000,BorderStyle=4,Alignment=5"
+          ffmpeg -y $TRIM -i input.mp4 -i input_audio.mp3 -vf "subtitles=subs.vtt:force_style='$STYLE'" -c:v libx264 -preset fast -crf 18 -c:a aac -shortest output_burned.mp4
+
+      - name: Upload to Cloudinary using unsigned preset
+        env:
+          CLOUD_NAME: dzrclu7ck
+          UPLOAD_PRESET: ${{ secrets.CLOUDINARY_UPLOAD_PRESET }}
+        run: |
+          RESPONSE=$(curl -s -X POST "https://api.cloudinary.com/v1_1/$CLOUD_NAME/video/upload" \
+            -F "file=@output_burned.mp4" \
+            -F "upload_preset=$UPLOAD_PRESET")
+          echo "$RESPONSE" > upload_response.json
+          echo "UPLOAD_URL=$(jq -r .secure_url upload_response.json)" >> $GITHUB_ENV
+
+      - name: Notify n8n webhook
+        run: |
+          curl -s -X POST "${{ github.event.inputs.n8nWebhook }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"finalUrl\":\"${{ env.UPLOAD_URL }}\"}"
